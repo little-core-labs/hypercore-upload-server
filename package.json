@@ -1,6 +1,6 @@
 {
   "name": "hypercore-upload-server",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "Accelerated uploads over Hypercore",
   "main": "index.js",
   "scripts": {
