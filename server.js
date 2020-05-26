@@ -377,7 +377,6 @@ class Server extends EventEmitter {
               return (debug(err), socket.close(WS_INTERNAL_ERROR))
             }
 
-            console.log('close');
             socket.close()
           })
         }
