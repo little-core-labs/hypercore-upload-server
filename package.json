@@ -1,7 +1,7 @@
 {
   "name": "hypercore-upload-server",
   "version": "0.0.2",
-  "description": "Accelerated uploads over Hypercore",
+  "description": "(WIP) File ingestion with Hypercore over WebSockets",
   "main": "index.js",
   "scripts": {
     "example-server": "node example/server",
