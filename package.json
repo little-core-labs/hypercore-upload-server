@@ -5,8 +5,7 @@
   "main": "index.js",
   "scripts": {
     "example-server": "node example/server",
-    "example-client": "node example/client",
-    "example-client-browser": "npm run budo -- --open example/client",
+    "example-client": "npm run budo -- --open example/client",
     "test": "nyc tape test/*.js",
     "budo": "scripts/budo -l -H localhost -p 3000"
   },
@@ -25,10 +24,12 @@
     "extend": "^3.0.2",
     "hypercore": "^9.1.0",
     "hypercore-crypto": "^2.1.0",
-    "hypercore-multipart": "^0.1.5",
+    "hypercore-multipart": "^0.2.0",
     "hypercore-protocol": "^8.0.0",
     "hypertrie": "^5.0.1",
+    "mutexify": "^1.3.0",
     "nanoassert": "^2.0.0",
+    "piscina": "^1.6.0",
     "pump": "^3.0.0",
     "random-access-file": "^2.1.4",
     "random-access-memory": "^3.1.1",
@@ -40,9 +41,15 @@
     "@geut/sodium-javascript-plus": "0.0.6",
     "babel-plugin-module-resolver": "^4.0.0",
     "babelify": "^10.0.0",
+    "blake2b": "^2.1.3",
     "budo": "^11.6.3",
     "cli-progress": "^3.8.2",
+    "filestream": "^5.0.0",
     "mkdirp-classic": "^0.5.3",
-    "simple-websocket": "^9.0.0"
+    "random-access-blob": "^0.1.2",
+    "random-access-web": "^2.0.3",
+    "simple-websocket": "^9.0.0",
+    "touch": "^3.1.0",
+    "varint": "^5.0.0"
   }
 }

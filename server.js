@@ -1,26 +1,162 @@
 const { EventEmitter } = require('events')
 const { keyPair } = require('hypercore-multipart')
-const Networking = require('corestore-swarm-networking')
 const hypertrie = require('hypertrie')
 const Corestore = require('corestore')
 const Protocol = require('hypercore-protocol')
 const crypto = require('hypercore-crypto')
 const extend = require('extend')
-const rimraf = require('rimraf')
+const mutex = require('mutexify')
 const debug = require('debug')('hypercore-upload-server')
 const Batch = require('batch')
 const path = require('path')
 const pump = require('pump')
+const Pool = require('piscina')
 const http = require('http')
 const ram = require('random-access-memory')
-const raf = require('random-access-file')
+const url = require('url')
 const ws = require('ws')
+
+const {
+  METADATA_EXTENSION,
+  SIGNAL_EXTENSION,
+  KEY_EXTENSION,
+  NAMESPACE
+} = require('./extension')
 
 /**
  * Default WebSocket max message payload size
  * @private
  */
-const DEFAULT_MAX_PAYLOAD = 9 * 1024 * 1024
+const DEFAULT_MAX_PAYLOAD = 32 * 1024 * 1024
+
+/**
+ * Bad request websocket error code
+ * @private
+ */
+const WS_BAD_REQUEST = 1007
+
+/**
+ * Internal error web socket error code.
+ * @private
+ */
+const WS_INTERNAL_ERROR = 1011
+
+/**
+ * Error message for missing master key in web socket connection.
+ * @private
+ */
+const WS_REASON_MISSING_MASTER_KEY = "Missing master key for this context."
+
+/**
+ * Error message for missing invalid context key in web socket connection.
+ * @private
+ */
+const WS_REASON_INVALID_CONTEXT_KEY_LENGTH = "Invalid context key length. Expecting 32 byte hex string."
+
+/**
+ * Error message for missing metadata in web socket connection.
+ * @private
+ */
+const WS_REASON_MISSING_METADATA = "Missing metadata in context."
+
+/**
+ * Error message for a bad feed audit in web socket connection.
+ * @private
+ */
+const WS_REASON_AUDIT_FAILED = "Audit failed. Rejecting feed."
+
+/**
+ * Error message for a general bad request in web socket connection.
+ * @private
+ */
+const WS_REASON_BAD_REQUEST = "Bad request."
+
+/**
+ * Error message for a general bad request in web socket connection.
+ * @private
+ */
+const WS_REASON_INTERNAL_ERROR = "An unknown internal error has occured."
+
+/**
+ * A garbage collector to remove dead files from the file system.
+ * @private
+ */
+class GarbageCollector {
+
+  /**
+   * `GarbageCollector` class constructor.
+   */
+  constructor(server, opts) {
+    this.ontimeout = this.ontimeout.bind(this)
+    this.timeout = opts.timeout
+    this.server = server
+    this.queue = new Set()
+    this.timer = null
+    this.lock = mutex()
+    this.pool = new Pool({
+      filename: path.resolve(__dirname, 'worker', 'gc.js')
+    })
+
+    this.init()
+  }
+
+  /**
+   * Called when the GC timer has run out.
+   */
+  ontimeout() {
+    this.collect((err) => {
+      if (err) {
+        debug(err)
+      }
+
+      this.init()
+    })
+  }
+
+  /**
+   * Initalizes the garbages collector, reseting state.
+   */
+  init(callback) {
+    this.timer = setTimeout(this.ontimeout, this.timeout)
+  }
+
+  /**
+   * Add a path to the queue for GC.
+   */
+  add(path) {
+    this.queue.add(path)
+  }
+
+  /**
+   * Remove a path from the queue for GC.
+   */
+  remove(path) {
+    this.queue.delete(path)
+  }
+
+  /**
+   * Reset the GC state.
+   */
+  reset() {
+    clearTimeout(this.timer)
+    this.queue.clear()
+    this.timer = null
+  }
+
+  /**
+   * Spawn worker thread to do GC.
+   */
+  collect(callback) {
+    this.lock((release) => {
+      const queue = Array.from(this.queue)
+      this.reset()
+      this.pool.runTask({ queue })
+        .then(() => release(callback))
+        .then((() => this.init()))
+        .catch((err) => release(callback, err))
+    })
+  }
+}
 
 /**
  * The `Server` class is a container for a HTTP WebSocket server listening for
@@ -38,41 +174,11 @@ class Server extends EventEmitter {
    */
   static defaults() {
     return {
-      maxPayload: DEFAULT_MAX_PAYLOAD,
       storage: ram,
+      workers: { write: null },
+      ws: { maxPayload: DEFAULT_MAX_PAYLOAD, },
+      gc: { timeout: 5 * 1000 }
     }
-  }
-
-  /**
-   * The extension and corestore namespace for this server.
-   * @static
-   * @accessor
-   * @type {String}
-   */
-  static get NAMESPACE() {
-    return 'hus'
-  }
-
-  /**
-   * The metadata extension for the hypercore protocol used by this server.
-   * This name is derived from the `NAMESPACE` static accessor.
-   * @static
-   * @accessor
-   * @type {String}
-   */
-  static get METADATA_EXTENSION() {
-    return `${this.NAMESPACE}/metadata`
-  }
-
-  /**
-   * The master key extension for the hypercore protocol used by this server.
-   * This name is derived from the `NAMESPACE` static accessor.
-   * @static
-   * @accessor
-   * @type {String}
-   */
-  static get KEY_EXTENSION() {
-    return `${this.NAMESPACE}/key`
   }
 
   /**
@@ -81,7 +187,6 @@ class Server extends EventEmitter {
    * @param {Object} opts
    * @param {?(Corestore)} opts.corestore
    * @param {?(Function)} opts.storage
-   * @param {?(Number)} opts.maxPayload
    * @param {?(String)} opts.path
    */
   constructor(opts) {
@@ -89,24 +194,86 @@ class Server extends EventEmitter {
 
     opts = extend(true, this.constructor.defaults(), opts)
 
-    this.storage = opts.storage
-    this.onwrite = opts.onwrite || null
+    let corestore = null
+
+    if (opts.corestore) {
+      corestore = opts.corestore.namespace(this.constructor.NAMESPACE)
+    } else {
+      corestore = new Corestore(opts.storage)
+    }
+
     this.discoveryKey = opts.discoveryKey || crypto.randomBytes(32)
-    this.corestore = opts.corestore || new Corestore(opts.storage)
-    this.networking = new Networking(this.corestore)
-    this.server = http.createServer()
-    this.maxPayload = opts.maxPayload
-    this.path = opts.path
+    this.corestore = corestore
+    this.options = opts
+    this.server = opts.server || http.createServer()
     this.trie = null
     this.wss = null
+    this.gc = new GarbageCollector(this, opts.gc)
 
     this.onconnection = this.onconnection.bind(this)
 
     this.corestore.ready((err) => {
       if (err) { this.emit('error', err) }
-      const feed = this.corestore.namespace(this.constructor.NAMESPACE).default()
+      const feed = this.corestore.default()
       this.trie = hypertrie(null, { feed })
-      this.networking.join(this.discoveryKey)
+    })
+  }
+
+  /**
+   * Save JSON metadata for a session key.
+   * @protected
+   */
+  saveMetadata(key, metadata, callback) {
+    const trieKey = `${NAMESPACE}/${key}/metadata`
+    const trieValue = Buffer.from(JSON.stringify(metadata))
+    this.trie.put(trieKey, trieValue, callback)
+  }
+
+  /**
+   * Get JSON metadata for a session key.
+   * @protected
+   */
+  getMetadata(key, callback) {
+    const trieKey = `${NAMESPACE}/${key}/metadata`
+    this.trie.get(trieKey, (err, res) => {
+      if (err) {
+        callback(err)
+      } else if (res.value) {
+        try {
+          const metadata = JSON.parse(res.value)
+          callback(null, metadata)
+        } catch (err) {
+          callback(err)
+        }
+      } else {
+        callback(null, null)
+      }
+    })
+  }
+
+  /**
+   * Save a master key for the session key.
+   * @protected
+   */
+  saveMasterKey(key, masterKey, callback) {
+    const trieKey = `${NAMESPACE}/${key}`
+    this.trie.put(trieKey, masterKey, callback)
+  }
+
+  /**
+   * Get a master key for the session key.
+   * @protected
+   */
+  getMasterKey(key, callback) {
+    const trieKey = `${NAMESPACE}/${key}`
+    this.trie.get(trieKey, (err, res) => {
+      if (err) {
+        callback(err)
+      } else if (res) {
+        callback(null, res.value || null)
+      } else {
+        callback(null, null)
+      }
     })
   }
 
@@ -117,187 +284,224 @@ class Server extends EventEmitter {
    * @param {http.IncomingMessage} request
    */
   onconnection(socket, request) {
-    const { METADATA_EXTENSION, KEY_EXTENSION } = this.constructor
-    const { corestore, storage, onwrite, trie } = this
+    const { pathname } = url.parse(request.url)
+    const params = pathname.split('/').filter(Boolean).reverse().slice(0, 3).reverse()
 
-    corestore.ready((err) => {
-      if (err) {
-        this.emit('error', err)
-        socket.close(1011)
-        return
-      }
+    // /<key>/[contextAction|partitionNumber]/[partitionAction]
+    const [ key, contextActionOrPartition, partitionAction ] = params
 
-      let [ page, key ] = request.url.split('/').reverse().filter(Boolean)
-      let masterKey = null
-      let channel = null
+    if (!key || 64 !== key.length) {
+      socket.close(WS_BAD_REQUEST, WS_REASON_INVALID_CONTEXT_KEY_LENGTH)
+      return
+    }
 
-      if (page && 64 === page.length) {
-        key = page
-        page = Number.NaN
+    const partitionNumber = parseInt(contextActionOrPartition) || Number.NaN
+    const contextAction = contextActionOrPartition
+
+    try {
+      if (Number.isNaN(partitionNumber)) {
+        this.oncontext(socket, request, key, contextAction)
+      } else if (partitionNumber) {
+        this.onpartition(socket, request, key, partitionNumber, partitionAction)
       } else {
-        page = parseInt(page) || Number.NaN
+        socket.close(WS_BAD_REQUEST, WS_REASON_BAD_REQUEST)
+      }
+    } catch (err) {
+      debug(err)
+      this.emit('error', err)
+    }
+  }
+
+  /**
+   * Called when a new context connection is made.
+   * @private
+   */
+  oncontext(socket, request, key, action) {
+    const { options, trie } = this
+    const connection = ws.createWebSocketStream(socket)
+    const extensions = {}
+
+    this.getMasterKey(key, (err, masterKey) => {
+      if (err) {
+        return (debug(err), socket.close(WS_INTERNAL_ERROR))
       }
 
-      if (!key || 64 !== key.length) {
-        return socket.close(1007)
+      if (!masterKey) {
+        masterKey = crypto.randomBytes(32)
       }
 
-      const connection = ws.createWebSocketStream(socket)
-      const protocol = new Protocol(false, { onchannelclose, live: true })
+      const publicKey = Buffer.from(key, 'hex')
+      const stream = new Protocol(false, { ack: true, live: true })
 
-      pump(connection, protocol, connection)
+      const channel = stream.open(publicKey)
 
-      // master key acquisition
-      if (key && Number.isNaN(page)) {
-        trie.get(key, (err, res) => {
-          masterKey = res && res.value ? res.value : crypto.randomBytes(32)
+      stream.once('error', (err) => {
+        debug(err)
+        socket.close(WS_INTERNAL_ERROR)
+      })
 
-          trie.put(key, masterKey, (err) => {
+      pump(stream, connection, stream)
+
+      this.saveMasterKey(key, masterKey, (err) => {
+        if (err) {
+          return (debug(err), socket.close(WS_INTERNAL_ERROR))
+        }
+      })
+
+      // register `KEY_EXTENSION` to send a randomly generated master key
+      // for this ingestion session
+      stream.registerExtension(KEY_EXTENSION).send(masterKey)
+
+      // register `SIGNAL_EXTENSION` to send a randomly generated master key
+      // for this ingestion session
+      stream.registerExtension(SIGNAL_EXTENSION, {
+        encoding: 'json',
+        onmessage(signal) {
+          if (signal && signal.complete) {
+            socket.close()
+
+            if ('function' === typeof options.oncomplete) {
+              options.oncomplete(key, metadata)
+            }
+          }
+        }
+      })
+
+      // register `METADATA_EXTENSION` to listen for incoming JSON metadata
+      // about the ingestion that we store in the trie
+      stream.registerExtension(METADATA_EXTENSION, {
+        encoding: 'json',
+        onmessage: (metadata) => {
+          this.saveMetadata(key, metadata, (err) => {
             if (err) {
-              this.emit('error', err)
-              socket.close(1011)
-              return
+              return (debug(err), socket.close(WS_INTERNAL_ERROR))
             }
 
-            channel = protocol.open(Buffer.from(key, 'hex'))
-
-            protocol.registerExtension(KEY_EXTENSION).send(masterKey)
-            protocol.registerExtension(METADATA_EXTENSION, {
-              encoding: 'json',
-              onmessage: onmetadata
-            })
+            console.log('close');
+            socket.close()
           })
-        })
-      } else if (key && false === Number.isNaN(page) && page > 0) {
-        trie.get(key, (err, res) => {
-          if (err) {
-            this.emit('error', err)
-            socket.close(1011)
-            return
-          }
-
-          masterKey = res.value
-
-          const { publicKey } = keyPair({ masterKey, page })
-          const feed = corestore.get({ key: publicKey })
-
-          channel = protocol.open(Buffer.from(key, 'hex'))
-
-          feed.replicate(false, { stream: protocol, live: true })
-
-          feed.once('sync', () => {
-            channel.close()
-
-            const file = storage(key)
-            const feeds = []
-
-            if ('function' !== typeof onwrite) {
-              try {
-                const dirname = path.dirname(feed._storage.data.filename)
-                rimraf(dirname, (err) => err && debug(err))
-              } catch (err) {
-                debug(err)
-              }
-            } else {
-              const ready = new Batch()
-
-              for (let i = 0; i < page - 1; ++i) {
-                const key = keyPair({ masterKey, page: i + 1 }).publicKey
-                feeds.push(corestore.get({ key }))
-                ready.push((next) => feed.ready(next))
-              }
-
-              ready.end((err) => {
-                if (err) {
-                  this.emit('error', err)
-                  socket.close(1011)
-                  return
-                }
-
-                const offset = feeds
-                  .slice(0, page)
-                  .map((feed) => feed.byteLength)
-                  .reduce((a, b) => a + b, 0)
-
-                trie.get(`${key}/metadata`, (err, res) => {
-                  if (err) {
-                    this.emit('error', err)
-                    socket.close(1011)
-                    return
-                  }
-
-                  let metadata = {}
-
-                  try {
-                    metadata = JSON.parse(res.value)
-                  } catch (err) {
-                    debug(err)
-                  }
-
-                  onwrite(masterKey, offset, feed.byteLength, feed, metadata, (err) => {
-                    if (err) {
-                      this.emit('error', err)
-                      socket.close(1011)
-                      return
-                    }
-
-                    try {
-                      const dirname = path.dirname(feed._storage.data.filename)
-                      rimraf(dirname, (err) => err && debug(err))
-                    } catch (err) {
-                      debug(err)
-                    }
-
-                    socket.close()
-                  })
-                })
-              })
-            }
-          })
-        })
-      }
-
-      function onmetadata(metadata) {
-        const { size, parts } = metadata
-        const feeds = []
-        const ready = new Batch()
-
-        let missing = parts
-
-        for (let i = 0; i < parts; ++i) {
-          const key = keyPair({ masterKey, page: i + 1 }).publicKey
-          feeds.push(corestore.get({ key }))
         }
-
-        for (const feed of feeds) {
-          ready.push((next) => feed.ready(next))
-          if (feed.length && feed.length === feed.downloaded()) {
-            missing--
-          } else {
-            feed.once('sync', () => {
-              missing--
-              poll()
-            })
-          }
-        }
-
-        ready.end(poll)
-
-        function poll() {
-          if (0 === missing) {
-            metadata.key = key
-            metadata.keys = feeds.map((feed) => feed.key.toString('hex'))
-            trie.put(`${key}/metadata`, JSON.stringify(metadata))
-            channel.close()
-          }
-        }
-      }
-
-      function onchannelclose() {
-        connection.end()
-        socket.close()
-      }
+      })
     })
+  }
+
+  /**
+   * Called when a new connection with a partition is made.
+   * @private
+   */
+  onpartition(socket, request, key, page, action) {
+    const { corestore, options, trie, gc } = this
+    const connection = ws.createWebSocketStream(socket)
+
+    return this.getMasterKey(key, (err, masterKey) => {
+      if (err) {
+        return (debug(err), socket.close(WS_INTERNAL_ERROR))
+      }
+
+      if (!masterKey) {
+        return socket.close(WS_BAD_REQUEST, WS_REASON_MISSING_MASTER_KEY)
+      }
+
+      this.getMetadata(key, (err, metadata) => {
+        if (err) {
+          return (debug(err), socket.close(WS_INTERNAL_ERROR))
+        }
+
+        if (!metadata) {
+          return socket.close(WS_BAD_REQUEST, WS_REASON_MISSING_METADATA)
+        }
+
+        oncontext({ masterKey, metadata })
+      })
+    })
+
+    function oncontext({ masterKey, metadata }) {
+      const { bufferSize, pageSize } = metadata
+      const { publicKey } = keyPair({ masterKey, pageSize, page })
+      const feed = corestore.get({ onwrite, key: publicKey })
+      const stream = feed.replicate(false, { ack: true })
+
+      let closed = false
+      let dirname = null
+
+      feed.ready(onready)
+      feed.once('sync', onsync)
+      stream.once('error', onerror)
+
+      socket.once('close', onclose)
+
+      return pump(connection, stream, connection)
+
+      function clear(index, done) {
+        for (const channel of stream.channels) {
+          channel.unwant({ start: index, length: 1 })
+        }
+
+        feed.clear(index, done)
+      }
+
+      function onerror(err) {
+        debug(err)
+        socket.close(WS_INTERNAL_ERROR, err.code || WS_REASON_INTERNAL_ERROR)
+      }
+
+      function onclose() {
+        if (closed) { return }
+        closed = true
+        if (dirname) {
+          gc.add(dirname)
+          if (feed) {
+            feed.destroyStorage()
+          }
+        }
+      }
+
+      function onwrite(index, data, peer, done) {
+        if ('function' !== typeof options.onwrite) {
+          return clear(index, done)
+        }
+
+        const offset = ((page - 1) * pageSize) + (index * bufferSize)
+        options.onwrite(key, offset, data, metadata, (err) => {
+          if (err) {
+            done(err)
+          } else {
+            clear(index, done)
+          }
+        })
+      }
+
+      function onready(err) {
+        if (err) {
+          return onerror(err)
+        } else if (feed._storage) {
+          if (feed._storage.data && feed._storage.data.filename) {
+            dirname = path.dirname(feed._storage.data.filename)
+          }
+        }
+      }
+
+      function onsync() {
+        feed.audit(onaudit)
+      }
+
+      function onaudit(err, report) {
+        if (err) {
+          return (debug(err), socket.close(WS_INTERNAL_ERROR))
+        }
+
+        if (report.invalid > 0) {
+          socket.close(WS_BAD_REQUEST, WS_REASON_AUDIT_FAILED)
+        } else {
+          setTimeout(() => socket.close(), 100)
+        }
+
+        if (dirname) {
+          gc.add(dirname)
+          feed.destroyStorage()
+        }
+      }
+    }
   }
 
   /**
@@ -320,9 +524,9 @@ class Server extends EventEmitter {
     if (!this.wss) {
       this.server.listen(...args)
       this.wss = new ws.Server({
-        maxPayload: this.maxPayload,
+        //maxPayload: this.options.ws.maxPayload,
         server: this.server,
-        path: this.path,
+        path: this.options.ws.path,
       })
 
       this.wss.on('connection', this.onconnection)
@@ -346,14 +550,10 @@ class Server extends EventEmitter {
       closing.push((next) => this.server.close(next))
     }
 
-    if (this.networking) {
-      closing.push((next) => this.networking.close(next))
-    }
-
     close.end((err) => {
       this.wss = null
       this.server = null
-      this.networking = null
+
       if ('function' === typeof callback) {
         callback(err)
       }
