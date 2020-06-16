@@ -177,6 +177,7 @@ class Server extends EventEmitter {
     return {
       corestore: null,
       storage: ram,
+      maxRequests: 4, // we lower this from the default 16 in hypercore for a more performant system
       ws: { maxPayload: DEFAULT_MAX_PAYLOAD, },
       gc: { timeout: 5 * 1000 }
     }
@@ -420,7 +421,12 @@ class Server extends EventEmitter {
     function oncontext({ masterKey, metadata }) {
       const { bufferSize, pageSize } = metadata
       const { publicKey } = keyPair({ masterKey, pageSize, page })
-      const feed = corestore.get({ onwrite, key: publicKey })
+      const feed = corestore.get({
+        onwrite,
+        maxRequests: options.maxRequests,
+        key: publicKey
+      })
+
       const stream = feed.replicate(false, { ack: true })
 
       let closed = false
