@@ -46,7 +46,8 @@ function upload(file, callback) {
   const corestore = new Corestore(createStorage, { indexing: true })
   const storage = raf(file)
 
-  const bufferSize = 2 * 1024 * 1024
+  // max buffer size can be 8MB because that is the max message size
+  const bufferSize = 4 * 1024 * 1024
   const pageSize = 64 * 1024 * 1024
 
   // metadata sent to the server before ingestion
@@ -140,26 +141,24 @@ function upload(file, callback) {
       // for the multipart ingestion
       const socket = connect(`/${context.key.toString('hex')}`)
 
-      socket.once('connect', () => {
-        console.log('connect');
-        // stream context for this ingestion, we want acks and the connection
-        // to be kept alive and to replicate corestore with initial feed (empty)
-        const stream = corestore.replicate(true, { ack: true, live: true })
+      // stream context for this ingestion, we want acks and the connection
+      // to be kept alive and to replicate corestore with initial feed (empty)
+      const stream = corestore.replicate(true, { ack: true, live: true })
 
-        pump(socket, stream, socket)
 
-        // register `KEY_EXTENSION` to listen for incoming master key for ingestion
-        stream.registerExtension(KEY_EXTENSION, {
-          onmessage(message) {
-            // send metadata payload to server
-            console.log('got master key', message.toString('hex'))
-            onmasterkey(message)
-          }
-        })
-
-        // register `METADATA_EXTENSION` to send JSON metadata about the ingestion
-        stream.registerExtension(METADATA_EXTENSION, { encoding: 'json' }).send(metadata)
+      // register `KEY_EXTENSION` to listen for incoming master key for ingestion
+      stream.registerExtension(KEY_EXTENSION, {
+        onmessage(message) {
+          // send metadata payload to server
+          console.log('got master key', message.toString('hex'))
+          onmasterkey(message)
+        }
       })
+
+      // register `METADATA_EXTENSION` to send JSON metadata about the ingestion
+      stream.registerExtension(METADATA_EXTENSION, { encoding: 'json' }).send(metadata)
+
+      pump(socket, stream, socket)
     })
   }
 

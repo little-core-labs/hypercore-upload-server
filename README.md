@@ -1,7 +1,7 @@
 hypercore-upload-server
 =======================
 
-> (WIP) File ingestion with Hypercore over WebSockets
+> File ingestion with Hypercore over WebSockets
 
 ## Installation
 
@@ -55,11 +55,27 @@ const server = new Server({
 
 ### `server = new Server(opts)`
 
-> TODO
+Create a new `Server` for hypercore uploads over websockets where `opts`
+can be:
+
+```js
+{
+  corestore: null, // a corestore for a hypercore/hypertrie factory
+  storage: null // an optional random access storage factory for a `Corestore` instance
+  onwrite: (key, offset, data, metadata, callback) => { ... }, // called when data for a key at an offset needs to be written
+  gc: {
+    timeout: 5 * 1000 // timeout in milliseconds before a worker thread GC's any resources
+  }
+}
+```
+
+See [`example/server.js`](example/server.js) for a complete example.
+
 
 #### `server.listen(port[, host[, callback]])`
 
-> TODO
+Listen on a given `port` an optional `host` calling `callback(err)` upon
+error or success.
 
 ## License
 

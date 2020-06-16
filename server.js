@@ -27,7 +27,7 @@ const {
  * Default WebSocket max message payload size
  * @private
  */
-const DEFAULT_MAX_PAYLOAD = 32 * 1024 * 1024
+const DEFAULT_MAX_PAYLOAD = 8 * 1024 * 1024
 
 /**
  * Bad request websocket error code
@@ -85,6 +85,7 @@ class GarbageCollector {
 
   /**
    * `GarbageCollector` class constructor.
+   * @private
    */
   constructor(server, opts) {
     this.ontimeout = this.ontimeout.bind(this)
@@ -174,8 +175,8 @@ class Server extends EventEmitter {
    */
   static defaults() {
     return {
+      corestore: null,
       storage: ram,
-      workers: { write: null },
       ws: { maxPayload: DEFAULT_MAX_PAYLOAD, },
       gc: { timeout: 5 * 1000 }
     }
@@ -187,7 +188,9 @@ class Server extends EventEmitter {
    * @param {Object} opts
    * @param {?(Corestore)} opts.corestore
    * @param {?(Function)} opts.storage
-   * @param {?(String)} opts.path
+   * @param {?(Object)} opts.ws
+   * @param {?(Object)} opts.gc
+   * @param {?(Number)} opts.gc.timeout
    */
   constructor(opts) {
     super()
@@ -522,11 +525,10 @@ class Server extends EventEmitter {
   listen(...args) {
     if (!this.wss) {
       this.server.listen(...args)
-      this.wss = new ws.Server({
-        //maxPayload: this.options.ws.maxPayload,
+      this.wss = new ws.Server(Object.assign(this.options.ws, {
         server: this.server,
         path: this.options.ws.path,
-      })
+      }))
 
       this.wss.on('connection', this.onconnection)
     }
