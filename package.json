@@ -7,7 +7,8 @@
     "example-server": "node example/server",
     "example-client": "npm run budo -- --open example/client",
     "test": "nyc tape test/*.js",
-    "budo": "scripts/budo -l -H localhost -p 3000"
+    "budo": "scripts/budo -l -H localhost -p 3000",
+    "start": "node server.js"
   },
   "keywords": [
     "hypercore",
@@ -51,5 +52,16 @@
     "simple-websocket": "^9.0.0",
     "touch": "^3.1.0",
     "varint": "^5.0.0"
-  }
+  },
+  "directories": {
+    "example": "example"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/little-core-labs/hypercore-upload-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/little-core-labs/hypercore-upload-server/issues"
+  },
+  "homepage": "https://github.com/little-core-labs/hypercore-upload-server#readme"
 }
